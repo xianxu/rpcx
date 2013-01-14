@@ -15,9 +15,8 @@ import (
 )
 
 // TODO: 
-//   - Service discovery
-//   - Dynamic adjust of number of connections
-//   - Shit :S, need to have timeout as a param, rather than as part of request, more flexible.
+//   - Service discovery (ServerSet)
+//   - Dynamic adjust of number of connections (do we need?)
 //
 // Generic load balancer logic in a distributed system. It provides:
 //   - Load balancing among multiple hosts/connections evenly (number of qps).
@@ -29,8 +28,10 @@ import (
 //
 
 var (
-	//TODO: better reporting.
+	//TODO: better err reporting.
 	TimeoutErr              = Error("rpcx.timeout")
+	CancelledErr            = Error("request cancelled")
+	CannotCloneErr          = Error("Clone failed due to incompatible types")
 	NilUnderlyingServiceErr = Error("underlying service is nil")
 
 	// Setting ProberReq to this value, the prober will use last request that triggers a service
@@ -51,6 +52,8 @@ const (
 	deadThreshold  float64 = 4   // factor over normal to be considered dead
 	errorFactor    float64 = 30  // treat errors as X times of normal latency
 	latencyBuffer  float64 = 1.5 // factor of how bad latency compared to context before react
+
+	// treating all errors as such latency when calculating latency stats.
 	maxErrorMicros int64   = 60000000
 
 	//TODO: hmm, how much to keep track? no good value without knowing qps. seems too complex to
@@ -68,26 +71,35 @@ const (
 	//        - network glitch affecting all hosts. Latencies on all hosts would go up, and since
 	//          the latencyContext() goes up, individual hosts will not be marked dead, we should
 	//          be fine.
-	supervisorHistorySize int = 100 // size of history to keep
+
+	// size of history to keep
+	supervisorHistorySize int = 100
+	// how many items needs to be collected before we consider marking service dead
+	supervisorHistoryPadding int64 = 5
 )
 
 type Error string
-
-type Timeout interface {
-	// provides the ms value that a service call should be timed out. 0 stands for not timing out.
-	GetTimeout() time.Duration
-}
 
 func (t Error) Error() string {
 	return string(t)
 }
 
 /*
- * An abstract service that transforms req to rep. Typically a service is a rpc, but not
- * necessarily so.
+An abstract service that transforms req to rsp. Typically a service is a rpc, but not
+necessarily so. Response object's created by caller, the Service usually inspect its type to
+determine how to fill it when rpc completes.
+
+The cancel argument's used for caller to signal cancellation. This is mostly for advisory purpose,
+implementation may or may not honor it.
+
+Service also implement the io.Closer interface for simple life cycle management.
  */
 type Service interface {
-	Serve(req interface{}, rsp interface{}, timeout time.Duration) error
+	// release any resources associated with this service.
+	io.Closer
+	// handle req, populate rsp, return err and optionally honor cancellation. cancel can be nil.
+	// req and rsp can't be nil.
+	Serve(req interface{}, rsp interface{}, cancel chan int) error
 }
 
 /*
@@ -98,7 +110,7 @@ type ServiceMaker interface {
 	Make() (name string, s Service, e error)
 }
 
-// general interface used to do basic reporting of service status. the parameters in order are:
+// General interface used to do basic reporting of service status. the parameters in order are:
 // req, rep, error and latency
 type ServiceReporter interface {
 	Report(interface{}, interface{}, error, int64)
@@ -110,42 +122,50 @@ type ProberReqLastFailType int
 // Wrapping on top of a Service, keeping track service history for load balancing purpose.
 // There are two strategy dealing with faulty services, either we can keep probing it, or
 // we can create a new service to replace the faulty one.
-// TODO: Supervisor a bad name, easy to confuse with Erlang's, which serve different purpose.
 type Supervisor struct {
+	// lock used to guard change of underlying service.
 	svcLock sync.RWMutex
-	service Service // underlying service.
-	name    string  // Human readable name
+
+	// underlying service
+	service Service
+
+	// Human readable name for logging purpose
+	name string
 
 	// latency stats
-	latencies      gostrich.IntSampler // Keeps track of host latency, in micro seconds
-	latencyAvg     int64               // Average latency
-	latencyContext func() float64      // A function that returns what's the average latency across
-	// some computation context, such as within a cluster that
-	// this supervisor belongs to.
-	// Supervisor would react when it's own latency's 2x, 4x of
-	// the preceived healthy average.
+	// Keeps track of host latency, in micro seconds
+	latencies gostrich.IntSampler
+	// Average latency, cached value from latencies sampler
+	latencyAvg int64
+	// A function that returns what's the average latency across some computation context, such
+	// as within a cluster. This gives context of how slow/bad this Service is performance, with
+	// respect to its peers. Supervisor's coded to react when self latency hitting 2x and 4x
+	// of latency context.
+	latencyContext func() float64
 
 	// Note the following two fields are int32 so that we can compare/set atomically
-	proberRunning   int32 // Mutable field of whether there's a prober running
-	replacerRunning int32 // Mutable field of whether we are replacing service
+	// Mutable field of whether there's a prober running
+	proberRunning int32
+	// Mutable field of whether we are replacing service
+	replacerRunning int32
 
-	// Strategy of dealing with fault, when a service is marked dead.
-	//   - To start a prober to probe
-	//   - To replace faulty service with a new service.
+	// Strategy of dealing with faults, when a service is marked dead. Those two strategies can
+	// be combined.
+	//   - To start a prober to probe, this is needed because upstream will not send more traffic
+	//     when a service's dead.
+	//   - To replace faulty service with a new service with a ServiceMaker.
 	//
 	// To use prober, set proberReq to non-null. If it's anything that's a ProberReqLastFailType,
-	// last req's used as probe req, otherwise proberReq is assumed to be the object to use.
+	// last req's used as probe req, otherwise proberReq is assumed to be the object to use. To
+	// replace faulty service, supply a ServiceMaker.
 	//
-	// To replace faulty service, supply a ServiceMaker.
-	// Specifying nil disable corresponding functionalities.
-	//
-	// If a serviceMaker is specified, we will replace dead service with one freshly created.
-	// This new service keeps old service state. When proberReq is not nil, probing will be
-	// started.
-	proberReq    interface{}
+	// When proberReq is not nil, probing will be started. When serviceMaker is nil, underlying
+	// service will not be replaced.
+	proberReq interface{}
 	serviceMaker ServiceMaker
 
-	reporter ServiceReporter // where to report service status, gostrich thing
+	// where to report service status, gostrich thing
+	reporter ServiceReporter
 }
 
 // A Balancer is supervisor that tracks last 100 service call status. It recovers mostly by keep
@@ -200,7 +220,7 @@ func MicroTilNow(then time.Time) int64 {
 }
 
 func (s *Supervisor) isDead() bool {
-	if !s.latencies.IsFull() || s.latencyContext == nil {
+	if s.latencies.Count() <= supervisorHistoryPadding || s.latencyContext == nil {
 		return false
 	}
 	avg := atomic.LoadInt64(&(s.latencyAvg))
@@ -208,17 +228,25 @@ func (s *Supervisor) isDead() bool {
 	return float64(avg) >= deadThreshold*overallAvg
 }
 
+func (s *Supervisor) Close() error {
+	s.svcLock.RLock()
+	defer s.svcLock.RUnlock()
+
+	return s.service.Close()
+}
+
 /*
  * Serve request. The basic logic's to call underlying service, keep track of latency and optionally
  * trigger prober/replacer.
  */
-func (s *Supervisor) Serve(req interface{}, rsp interface{}, timeout time.Duration) (err error) {
+func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel chan int) (err error) {
 	then := time.Now()
 	s.svcLock.RLock()
 	if s.service == nil {
 		err = NilUnderlyingServiceErr
+		//TODO: logging
 	} else {
-		err = s.service.Serve(req, rsp, timeout)
+		err = s.service.Serve(req, rsp, cancel)
 	}
 
 	// micro seconds
@@ -229,20 +257,18 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, timeout time.Durati
 		s.reporter.Report(req, rsp, err, latency)
 	}
 
-	//log.Printf("Latency context is %v", s.latencyContext())
 	if err != nil {
-		if !s.latencies.IsFull() {
-			latency = maxErrorMicros
-		} else {
-			latency = int64(math.Min(s.latencyContext()*errorFactor, float64(maxErrorMicros)))
-		}
+		latency = int64(math.Min(s.latencyContext()*errorFactor, float64(maxErrorMicros)))
 	}
 
-	//TODO: observe selectively, we only keep track of 10 request latencies. Ideally it should be
+	//TODO: observe selectively, we only keep track of 100 request latencies. Ideally it should be
 	//      spread over 1 sec interval. one way to do it is to have some chan sending signaling
 	//      every 1 second. each supervisor keeps track of call counts, it's cleared when tick
 	//      is received. this way we can roughly keep track of qps. then we just need to sample
-	//      based on that qps.
+	//      based on that qps. Call this qps estimator.
+	//
+	//      Another approach is the approximate sampling:
+    //			https://github.com/samuel/go-metrics/blob/master/metrics/histogram_mp.go
 	s.latencies.Observe(latency)
 	sampled := s.latencies.Sampled()
 	avg := average(sampled)
@@ -262,8 +288,7 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, timeout time.Durati
 			if atomic.CompareAndSwapInt32((*int32)(&s.replacerRunning), 0, 1) {
 				// setting service to nil prevents service being used till new serivce is created.
 				s.svcLock.Lock()
-				if closer, ok := Service(s).(io.Closer); ok {
-					err := closer.Close()
+				if err := s.Close(); err != nil {
 					log.Printf("Error closing a service %v, the error is %v", s.name, err)
 				}
 				s.service = nil
@@ -308,9 +333,9 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, timeout time.Durati
 
 						switch s.proberReq.(type) {
 						case ProberReqLastFailType:
-							s.Serve(req, rsp, timeout)
+							s.Serve(req, rsp, nil)
 						default:
-							s.Serve(s.proberReq, rsp, timeout)
+							s.Serve(s.proberReq, rsp, nil)
 						}
 					}
 				}()
@@ -320,34 +345,47 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, timeout time.Durati
 	return
 }
 
-// Wrapper of a service that honors timeout. Typically timeouts can be more efficiently coded by
-// concrete service implementations. This is here for cases where underlying service doesn't
-// provide timeout mechanism.
-type ServiceWithTimeout struct {
+// Wrapper of a service to provide better behavior like timeout and retries. Timeouts are not
+// retried.
+type RobustService struct {
 	Service Service
 	Timeout time.Duration
+	Retries int
+
+	// A function to determine if we should retry. If nil, all errors are retried.
+	RetryFn func(req interface{}, rsp interface{}, err error) bool
 }
 
-func (s *ServiceWithTimeout) Serve(req interface{}, rsp interface{}, timeout time.Duration) (err error) {
-	if timeout > 0 {
-		tick := time.After(timeout)
-		// need at least 1 capacity so that when a rpc call return after timeout has occurred,
-		// it doesn't block the goroutine sending such notification.
-		// not sure why rpc package uses capacity 10 though.
-		done := make(chan error, 1)
+func (s *RobustService) Close() error {
+	return s.Close()
+}
 
-		go func() {
-			err = s.Service.Serve(req, rsp, timeout)
-			done <- err
-		}()
-
-		select {
-		case <-done:
-		case <-tick:
-			err = TimeoutErr
+func (s *RobustService) Serve(req interface{}, rsp interface{}, cancel chan int) (err error) {
+	err =CancelledErr
+	tries := s.Retries + 1
+	for ; (err == CancelledErr || s.RetryFn == nil || s.RetryFn(req, rsp, err)) &&
+		tries > 0; tries += 1 {
+		// check for cancellation
+		if isCancelled(cancel) {
+			return
 		}
-	} else {
-		err = s.Service.Serve(req, rsp, timeout)
+		if s.Timeout > 0 {
+			tick := time.After(s.Timeout)
+			// need at least 1 capacity so that when a rpc call return after timeout has occurred,
+			// it doesn't block the goroutine sending such notification.
+			// not sure why rpc package uses capacity 10 though.
+			done := make(chan error, 1)
+
+			go func() { done <- s.Service.Serve(req, rsp, cancel) }()
+
+			select {
+			case err = <-done:
+			case <-tick:
+				err = TimeoutErr
+			}
+		} else {
+			err = s.Service.Serve(req, rsp, cancel)
+		}
 	}
 	return
 }
@@ -357,24 +395,26 @@ func (s *ServiceWithTimeout) Serve(req interface{}, rsp interface{}, timeout tim
  * services across multiple machines. At lower level, it can also be used to manage connection
  * pool to a single host.
  *
- * TODO: don't query dead service?
+ * TODO: don't query dead service at all?
  * TODO: the logic to grow and shrink the service pool is not implemented yet.
  */
 type Cluster struct {
 	Name     string
 	Services []*Supervisor
-	Retries  int             // if there's failure, retry another host
-	Reporter ServiceReporter // stats reporter of how cluster, rolled up from each host
+	// if there's failure, retry another host, this is the number of times to retry
+	Retries  int
+	// stats reporter of how cluster, rolled up from each host
+	Reporter ServiceReporter
 
 	// internals, default values' fine
-	Lock sync.RWMutex // guard services
+	lock sync.RWMutex // guard services
 }
 
 // this is only called if there's at least one downstream service register. so this must succeed
 // TODO: tricky part though is the case of cold start
 func (c *Cluster) LatencyAvg() float64 {
-	c.Lock.RLock()
-	defer c.Lock.RUnlock()
+	c.lock.RLock()
+	defer c.lock.RUnlock()
 
 	sum := 0.0
 	for _, s := range c.Services {
@@ -402,9 +442,9 @@ func (c *Cluster) pickAService() *Supervisor {
 	return s
 }
 
-func (c *Cluster) serveOnce(req interface{}, rsp interface{}, timeout time.Duration) (err error) {
-	c.Lock.RLock()
-	defer c.Lock.RUnlock()
+func (c *Cluster) serveOnce(req interface{}, rsp interface{}, cancel chan int) (err error) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
 
 	then := time.Now()
 
@@ -417,7 +457,7 @@ func (c *Cluster) serveOnce(req interface{}, rsp interface{}, timeout time.Durat
 	s := c.pickAService()
 
 	// serve
-	err = s.Serve(req, rsp, timeout)
+	err = s.Serve(req, rsp, cancel)
 
 	if c.Reporter != nil {
 		latency := MicroTilNow(then)
@@ -427,13 +467,28 @@ func (c *Cluster) serveOnce(req interface{}, rsp interface{}, timeout time.Durat
 	return
 }
 
-func (c *Cluster) Serve(req interface{}, rsp interface{}, timeout time.Duration) (err error) {
+// error returned would be the last
+func (c *Cluster) Close() (err error) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	for _, s := range c.Services {
+		if e := s.Close(); e != nil {
+			err = e
+		}
+	}
+	return
+}
+
+func (c *Cluster) Serve(req interface{}, rsp interface{}, cancel chan int) (err error) {
 	for i := 0; i <= c.Retries; i += 1 {
-		err = c.serveOnce(req, rsp, timeout)
+		err = c.serveOnce(req, rsp, cancel)
 		if err == nil {
 			return
 		} else {
 			log.Printf("Error serving request in cluster %v. Error is: %v\n", c.Name, err)
+		}
+		if isCancelled(cancel) {
+			return
 		}
 	}
 	log.Printf("Exhausted retries of serving request in cluster %v\n", c.Name)
@@ -578,4 +633,15 @@ func average(ns []int64) float64 {
 		sum += float64(atomic.LoadInt64(&ns[i]))
 	}
 	return float64(sum) / float64(len(ns))
+}
+
+func isCancelled(cancel chan int) bool {
+	if cancel != nil {
+		select {
+		case <-cancel:
+			return true
+		default:
+		}
+	}
+	return false
 }
