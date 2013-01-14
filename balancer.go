@@ -54,7 +54,7 @@ const (
 	maxErrorMicros int64   = 60000000
 
 	// size of history to keep
-	supervisorHistorySize int = 100
+	supervisorHistorySize int = 100  //TODO: make this 20? need to parse through code to make sure
 	// how many items needs to be collected before we consider marking service dead
 	supervisorHistoryPadding int64 = 5
 )
@@ -80,7 +80,7 @@ type Service interface {
 	io.Closer
 	// handle req, populate rsp, return err and optionally honor cancellation. cancel can be nil.
 	// req and rsp can't be nil.
-	Serve(req interface{}, rsp interface{}, cancel chan int) error
+	Serve(req interface{}, rsp interface{}, cancel *bool) error
 }
 
 /*
@@ -147,6 +147,9 @@ type Supervisor struct {
 
 	// where to report service status, gostrich thing
 	reporter ServiceReporter
+
+	// estimate of current qps
+	qps *gostrich.QpsTracker
 }
 
 // A Balancer is supervisor that tracks last 100 service call status. It recovers mostly by keep
@@ -170,6 +173,7 @@ func NewSupervisor(
 		proberReq,
 		serviceMaker,
 		reporter,
+		gostrich.NewQpsTracker(time.Second), // TODO configure
 	}
 }
 
@@ -193,6 +197,7 @@ func NewReplaceable(
 		nil,
 		serviceMaker,
 		reporter,
+		gostrich.NewQpsTracker(time.Second), // TODO configure
 	}
 }
 
@@ -220,7 +225,7 @@ func (s *Supervisor) Close() error {
  * Serve request. The basic logic's to call underlying service, keep track of latency and optionally
  * trigger prober/replacer.
  */
-func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel chan int) (err error) {
+func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err error) {
 	then := time.Now()
 	s.svcLock.RLock()
 	if s.service == nil {
@@ -246,13 +251,21 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel chan int) (e
 	//      let's add a gostrich.QpsTracker to estimate past qps. If qps's too high (say > 100),
 	//      we will begin sampling. E.g. if qps' estimated at 1K, we will Observe once every 10
 	//      request, for the purpose of load balancing.
-	s.latencies.Observe(latency)
-	sampled := s.latencies.Sampled()
-	avg := average(sampled)
-	// set average for faster access later on.
-	atomic.StoreInt64(&(s.latencyAvg), int64(avg))
+	s.qps.Record()
+	recordIt := func() {
+		s.latencies.Observe(latency)
+		sampled := s.latencies.Sampled()
+		avg := average(sampled)
+		// set average for faster access later on.
+		atomic.StoreInt64(&(s.latencyAvg), int64(avg))
+	}
+	if s.latencies.Count() < int64(s.latencies.Length()) {
+		// for first supervisorHistorySize requests, always record it.
+		recordIt()
+	} else {
+		gostrich.DoWithChance(chance(s.qps.Ticks()), recordIt)
+	}
 
-	//log.Printf("current %v avg %v, %v", latency, avg, sampled)
 	s.svcLock.RUnlock()
 	// End of lock
 
@@ -337,13 +350,13 @@ func (s *RobustService) Close() error {
 	return s.Close()
 }
 
-func (s *RobustService) Serve(req interface{}, rsp interface{}, cancel chan int) (err error) {
+func (s *RobustService) Serve(req interface{}, rsp interface{}, cancel *bool) (err error) {
 	err =CancelledErr
 	tries := s.Retries + 1
 	for ; (err == CancelledErr || s.RetryFn == nil || s.RetryFn(req, rsp, err)) &&
 		tries > 0; tries += 1 {
 		// check for cancellation
-		if isCancelled(cancel) {
+		if cancel != nil && *cancel {
 			return
 		}
 		if s.Timeout > 0 {
@@ -419,7 +432,7 @@ func (c *Cluster) pickAService() *Supervisor {
 	return s
 }
 
-func (c *Cluster) serveOnce(req interface{}, rsp interface{}, cancel chan int) (err error) {
+func (c *Cluster) serveOnce(req interface{}, rsp interface{}, cancel *bool) (err error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
@@ -456,7 +469,7 @@ func (c *Cluster) Close() (err error) {
 	return
 }
 
-func (c *Cluster) Serve(req interface{}, rsp interface{}, cancel chan int) (err error) {
+func (c *Cluster) Serve(req interface{}, rsp interface{}, cancel *bool) (err error) {
 	for i := 0; i <= c.Retries; i += 1 {
 		err = c.serveOnce(req, rsp, cancel)
 		if err == nil {
@@ -464,7 +477,7 @@ func (c *Cluster) Serve(req interface{}, rsp interface{}, cancel chan int) (err 
 		} else {
 			log.Printf("Error serving request in cluster %v. Error is: %v\n", c.Name, err)
 		}
-		if isCancelled(cancel) {
+		if cancel != nil && *cancel {
 			return
 		}
 	}
@@ -612,13 +625,8 @@ func average(ns []int64) float64 {
 	return float64(sum) / float64(len(ns))
 }
 
-func isCancelled(cancel chan int) bool {
-	if cancel != nil {
-		select {
-		case <-cancel:
-			return true
-		default:
-		}
-	}
-	return false
+func chance(n int32)float32 {
+	q := float32((n / 10 + 1) * 10)           // upper floor to avoid extremes
+	return float32(supervisorHistorySize) / q // the chance we should record a event
 }
+
