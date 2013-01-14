@@ -14,28 +14,25 @@ import (
 	"time"
 )
 
-// TODO: 
-//   - Service discovery (ServerSet)
-//   - Dynamic adjust of number of connections (do we need?)
-//
 // Generic load balancer logic in a distributed system. It provides:
 //   - Load balancing among multiple hosts/connections evenly (number of qps).
 //   - Aware of difference in machine power. Query fast machines more. 
 //   - Probing when a service's dead (Supervisor).
 //   - Recreate service when dead for a whlie (Replaceable, Supervisor)
 //
-// And later on for distributed tracking etc. client ids etc.
-//
+// TODO:
+//   - Service discovery (ServerSet)
+//   - Dynamic adjust of number of connections (do we need?)
+//   - And later on for distributed tracking etc. client ids etc.
 
 var (
-	//TODO: better err reporting.
 	TimeoutErr              = Error("rpcx.timeout")
 	CancelledErr            = Error("request cancelled")
 	CannotCloneErr          = Error("Clone failed due to incompatible types")
 	NilUnderlyingServiceErr = Error("underlying service is nil")
 
 	// Setting ProberReq to this value, the prober will use last request that triggers a service
-	// being marked dead as the prober req. This works fine for idempotent requests. Otherwise
+	// being marked as dead as the prober req. This works fine for idempotent requests. Otherwise
 	// doesn't work and prober req would be in other form.
 	ProberReqLastFail ProberReqLastFailType
 )
@@ -55,22 +52,6 @@ const (
 
 	// treating all errors as such latency when calculating latency stats.
 	maxErrorMicros int64   = 60000000
-
-	//TODO: hmm, how much to keep track? no good value without knowing qps. seems too complex to
-	//      keep track of actual qps to worth it. Let's just have a reasonable value? Say targeting
-	//      10K qps and range of 10 second. Meaning 100K values. If we sample at 1 per 1K, need to
-	//      keep track of 100. When traffic's low, the synptom's the load balancer will be slow
-	//      to react to error conditions.
-	//
-	//      The problem of keeping track of last 100? A short lived network glitch would trigger
-	//      state changes. Now, consider the following cases:
-	//
-	//        - network glitch on a host, while others are fine. This means service to that host
-	//          will timeout, and thus get disabled and later replaced, which while not ideal, is
-	//          fine.
-	//        - network glitch affecting all hosts. Latencies on all hosts would go up, and since
-	//          the latencyContext() goes up, individual hosts will not be marked dead, we should
-	//          be fine.
 
 	// size of history to keep
 	supervisorHistorySize int = 100
@@ -261,20 +242,16 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel chan int) (e
 		latency = int64(math.Min(s.latencyContext()*errorFactor, float64(maxErrorMicros)))
 	}
 
-	//TODO: observe selectively, we only keep track of 100 request latencies. Ideally it should be
-	//      spread over 1 sec interval. one way to do it is to have some chan sending signaling
-	//      every 1 second. each supervisor keeps track of call counts, it's cleared when tick
-	//      is received. this way we can roughly keep track of qps. then we just need to sample
-	//      based on that qps. Call this qps estimator.
-	//
-	//      Another approach is the approximate sampling:
-    //			https://github.com/samuel/go-metrics/blob/master/metrics/histogram_mp.go
+	//TODO: observe selectively, since we only keep track of 100 request latencies.
+	//      let's add a gostrich.QpsTracker to estimate past qps. If qps's too high (say > 100),
+	//      we will begin sampling. E.g. if qps' estimated at 1K, we will Observe once every 10
+	//      request, for the purpose of load balancing.
 	s.latencies.Observe(latency)
 	sampled := s.latencies.Sampled()
 	avg := average(sampled)
-
 	// set average for faster access later on.
 	atomic.StoreInt64(&(s.latencyAvg), int64(avg))
+
 	//log.Printf("current %v avg %v, %v", latency, avg, sampled)
 	s.svcLock.RUnlock()
 	// End of lock
