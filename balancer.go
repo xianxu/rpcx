@@ -14,26 +14,28 @@ import (
 	"time"
 )
 
-// Generic load balancer logic in a distributed system. It provides:
-//   - Load balancing among multiple hosts/connections evenly (number of qps).
-//   - Aware of difference in machine power. Query fast machines more. 
-//   - Probing when a service's dead (Supervisor).
-//   - Recreate service when dead for a whlie (Replaceable, Supervisor)
-//
-// TODO:
-//   - Service discovery (ServerSet)
-//   - Dynamic adjust of number of connections (do we need?)
-//   - And later on for distributed tracking etc. client ids etc.
+/*
+   Generic load balancer logic in a distributed system. It provides:
+     - Load balancing among multiple hosts/connections evenly (number of qps).
+     - Aware of difference in machine power. Query fast machines more.
+     - Probing when a service's dead (Supervisor).
+     - Recreate service when dead for a while (Supervisor)
+
+   TODO:
+     - Service discovery (ServerSet)
+     - Dynamic adjust of number of connections (do we need?)
+
+ */
 
 var (
-	TimeoutErr              = Error("rpcx.timeout")
+	TimeoutErr              = Error("request timeout")
 	CancelledErr            = Error("request cancelled")
-	CannotCloneErr          = Error("Clone failed due to incompatible types")
-	NilUnderlyingServiceErr = Error("underlying service is nil")
+	NilUnderlyingServiceErr = Error("underlying service is nil or empty")
 
 	// Setting ProberReq to this value, the prober will use last request that triggers a service
 	// being marked as dead as the prober req. This works fine for idempotent requests. Otherwise
-	// doesn't work and prober req would be in other form.
+	// doesn't work and prober req would be in other form, e.g. a different request hitting same
+	// service.
 	ProberReqLastFail ProberReqLastFailType
 )
 
@@ -45,16 +47,17 @@ const (
 	// Note, the following can be tweaked for fault tolerant behavior. They can be made as per
 	// service configuration. However, I feel a good choice of values can provide sufficient values,
 	// and freeing clients to figure out good values of those arcane numbers.
-	flakyThreshold float64 = 2   // factor over normal to be considered flaky
 	deadThreshold  float64 = 4   // factor over normal to be considered dead
 	errorFactor    float64 = 30  // treat errors as X times of normal latency
 	latencyBuffer  float64 = 1.5 // factor of how bad latency compared to context before react
 
-	// treating all errors as such latency when calculating latency stats.
+	// max error latency
 	maxErrorMicros int64   = 60000000
 
 	// size of history to keep
-	supervisorHistorySize int = 100  //TODO: make this 20? need to parse through code to make sure
+	supervisorHistorySize int = 30
+	// how long latency history do we care, 5 second seems reasonable
+	reactionPeriod int = 5
 	// how many items needs to be collected before we consider marking service dead
 	supervisorHistoryPadding int64 = 5
 )
@@ -85,14 +88,15 @@ type Service interface {
 
 /*
  * Maker of a service, this is used to recreate a service in case of persisted errors. Maker would
- * typically contain state such as which host to connect to etc.
+ * typically wrap state such as which host to connect to etc.
  */
 type ServiceMaker interface {
-	Make() (name string, s Service, e error)
+	Name() string
+	Make() (s Service, e error)
 }
 
 // General interface used to do basic reporting of service status. the parameters in order are:
-// req, rep, error and latency
+// req, rep, error and latency.
 type ServiceReporter interface {
 	Report(interface{}, interface{}, error, int64)
 }
@@ -102,7 +106,8 @@ type ProberReqLastFailType int
 
 // Wrapping on top of a Service, keeping track service history for load balancing purpose.
 // There are two strategy dealing with faulty services, either we can keep probing it, or
-// we can create a new service to replace the faulty one.
+// we can create a new service to replace the faulty one. Supervisor's intended to work in
+// a Cluster, rather than be used alone. TODO: hide this?
 type Supervisor struct {
 	// lock used to guard change of underlying service.
 	svcLock sync.RWMutex
@@ -116,8 +121,10 @@ type Supervisor struct {
 	// latency stats
 	// Keeps track of host latency, in micro seconds
 	latencies gostrich.IntSampler
+
 	// Average latency, cached value from latencies sampler
 	latencyAvg int64
+
 	// A function that returns what's the average latency across some computation context, such
 	// as within a cluster. This gives context of how slow/bad this Service is performance, with
 	// respect to its peers. Supervisor's coded to react when self latency hitting 2x and 4x
@@ -127,6 +134,7 @@ type Supervisor struct {
 	// Note the following two fields are int32 so that we can compare/set atomically
 	// Mutable field of whether there's a prober running
 	proberRunning int32
+
 	// Mutable field of whether we are replacing service
 	replacerRunning int32
 
@@ -143,6 +151,7 @@ type Supervisor struct {
 	// When proberReq is not nil, probing will be started. When serviceMaker is nil, underlying
 	// service will not be replaced.
 	proberReq interface{}
+
 	serviceMaker ServiceMaker
 
 	// where to report service status, gostrich thing
@@ -152,8 +161,11 @@ type Supervisor struct {
 	qps *gostrich.QpsTracker
 }
 
-// A Balancer is supervisor that tracks last 100 service call status. It recovers mostly by keep
+// A Balancer is Supervisor that tracks last 30 service call status. It recovers mostly by keep
 // probing. In other cases, ServiceMaker may be invoked to recreate all underlying services.
+
+// Note: The name + service is somewhat duplicate of serviceMaker, it's there so that serviceMaker
+//       is not mandatory.
 func NewSupervisor(
 	name string,
 	service Service,
@@ -173,31 +185,7 @@ func NewSupervisor(
 		proberReq,
 		serviceMaker,
 		reporter,
-		gostrich.NewQpsTracker(time.Second), // TODO configure
-	}
-}
-
-// A replaceable service that recovers from error by replacing underlying service with a new one
-// from service maker.
-func NewReplaceable(
-	name string,
-	service Service,
-	latencyContext func() float64,
-	reporter ServiceReporter,
-	serviceMaker ServiceMaker) *Supervisor {
-	return &Supervisor{
-		sync.RWMutex{},
-		service,
-		name,
-		gostrich.NewIntSampler(2),
-		0,
-		latencyContext,
-		0,
-		0,
-		nil,
-		serviceMaker,
-		reporter,
-		gostrich.NewQpsTracker(time.Second), // TODO configure
+		gostrich.NewQpsTracker(time.Second),
 	}
 }
 
@@ -206,6 +194,9 @@ func MicroTilNow(then time.Time) int64 {
 }
 
 func (s *Supervisor) isDead() bool {
+	// wait till we have enough "bad" samples before reporting dead. Also, if there's no context
+	// service won't be dead thus bypassing all service recreation logic. If Supervisor's used
+	// directly outside of a Cluster, supply a function that reports "normal" latency as context.
 	if s.latencies.Count() <= supervisorHistoryPadding || s.latencyContext == nil {
 		return false
 	}
@@ -214,11 +205,13 @@ func (s *Supervisor) isDead() bool {
 	return float64(avg) >= deadThreshold*overallAvg
 }
 
-func (s *Supervisor) Close() error {
-	s.svcLock.RLock()
-	defer s.svcLock.RUnlock()
+func (s *Supervisor) Close() (err error) {
+	s.svcLock.Lock()
+	defer s.svcLock.Unlock()
 
-	return s.service.Close()
+	err = s.service.Close()
+	s.service = nil
+	return
 }
 
 /*
@@ -235,7 +228,6 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 		err = s.service.Serve(req, rsp, cancel)
 	}
 
-	// micro seconds
 	latency := MicroTilNow(then)
 
 	// collect stats before adjusting latency
@@ -244,13 +236,10 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 	}
 
 	if err != nil {
+		// treat errors as errorFactor times average context latency, ceiling at 60 seconds
 		latency = int64(math.Min(s.latencyContext()*errorFactor, float64(maxErrorMicros)))
 	}
 
-	//TODO: observe selectively, since we only keep track of 100 request latencies.
-	//      let's add a gostrich.QpsTracker to estimate past qps. If qps's too high (say > 100),
-	//      we will begin sampling. E.g. if qps' estimated at 1K, we will Observe once every 10
-	//      request, for the purpose of load balancing.
 	s.qps.Record()
 	recordIt := func() {
 		s.latencies.Observe(latency)
@@ -260,9 +249,12 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 		atomic.StoreInt64(&(s.latencyAvg), int64(avg))
 	}
 	if s.latencies.Count() < int64(s.latencies.Length()) {
-		// for first supervisorHistorySize requests, always record it.
+		// fill all sample slots first, the case for startup
 		recordIt()
 	} else {
+		// logic: we have keep 30 "supervisorHistorySize" samples and want to span that across
+		// 5 sec (reactionPeriod), if we are at 6 qps, we do full sample; if we are at 60 qps,
+		// we sample every 10%
 		gostrich.DoWithChance(chance(s.qps.Ticks()), recordIt)
 	}
 
@@ -288,7 +280,7 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 						"try replacing underlying service at fixed interval, until "+
 						"service become healthy.", s.name)
 					for {
-						_, newService, err := s.serviceMaker.(ServiceMaker).Make()
+						newService, err := s.serviceMaker.Make()
 						if err == nil {
 							log.Printf("replacer obtained new service for \"%v\"", s.name)
 							s.svcLock.Lock()
@@ -351,8 +343,10 @@ func (s *RobustService) Close() error {
 }
 
 func (s *RobustService) Serve(req interface{}, rsp interface{}, cancel *bool) (err error) {
-	err =CancelledErr
+	err = CancelledErr
 	tries := s.Retries + 1
+	// loop if 1. is first request; or 2. retry fn is not set (retry on err); or 3 retry fn set and
+	// allow retry. Conditioned on tries > 0
 	for ; (err == CancelledErr || s.RetryFn == nil || s.RetryFn(req, rsp, err)) &&
 		tries > 0; tries += 1 {
 		// check for cancellation
@@ -375,6 +369,10 @@ func (s *RobustService) Serve(req interface{}, rsp interface{}, cancel *bool) (e
 			}
 		} else {
 			err = s.Service.Serve(req, rsp, cancel)
+		}
+		// check for error
+		if err == nil {
+			return
 		}
 	}
 	return
@@ -401,7 +399,6 @@ type Cluster struct {
 }
 
 // this is only called if there's at least one downstream service register. so this must succeed
-// TODO: tricky part though is the case of cold start
 func (c *Cluster) LatencyAvg() float64 {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
@@ -420,14 +417,11 @@ func (c *Cluster) pickAService() *Supervisor {
 	var s *Supervisor
 	for retries := 0; rand.Float64() >= prob && retries < maxSelectorRetry; retries += 1 {
 		s = c.Services[rand.Int()%len(c.Services)]
-		//TODO:
-		//  - tweak formula
-		//  - should we not call dead service at all? current it's still called with certain prob.
 		if s.isDead() {
 			// if all services are dead, we will choose the last one, this is by design
 			continue
 		}
-		prob = math.Min(1, (latencyC*latencyBuffer)/float64(s.latencyAvg))
+		prob = math.Min(1, (latencyC*latencyBuffer)/float64(math.Max(float64(s.latencyAvg), 1)))
 	}
 	return s
 }
@@ -439,7 +433,7 @@ func (c *Cluster) serveOnce(req interface{}, rsp interface{}, cancel *bool) (err
 	then := time.Now()
 
 	if len(c.Services) == 0 {
-		err = Error("There's no underlying service in cluster " + c.Name)
+		err = NilUnderlyingServiceErr
 		return
 	}
 
@@ -531,23 +525,23 @@ type RpcClient interface {
 }
 
 // Using cassandra as an example, typical setup is:
-//
-//                                  /  Replaceable - KeyspaceService  --\
-//            Supervisor - Cluster  -  Replaceable - KeyspaceService  ---->  Cassandra host 1
-//          /                       \  Replaceable - KeyspaceService  --/
-//         / 
+//                                     host1:conn1
+//              host1       host1   /  Supervisor - KeyspaceService  --\
+//            Supervisor - Cluster  -  Supervisor - KeyspaceService  ---->  Cassandra host 1
+//          /                       \  Supervisor - KeyspaceService  --/
+//  Name  /
 // Cluster  
 //         \
-//          \                       /  Replaceable - KeyspaceService  --\
-//            Supervisor - Cluster  -  Replaceable - KeyspaceService  ---->  Cassandra host 2
-//                                  \  Replaceable - KeyspaceService  --/
+//          \                       /  Supervisor - KeyspaceService  --\
+//            Supervisor - Cluster  -  Supervisor - KeyspaceService  ---->  Cassandra host 2
+//                                  \  Supervisor - KeyspaceService  --/
 //
 // Create a reliable service out of a group of service makers. n services will be created by
 // each ServiceMaker (think connections).
 type ReliableServiceConf struct {
 	Name         string
 	Makers       []ServiceMaker // ClientBuilder
-	Retries      int            // default to 0
+	Retries      int            // default to 0, retry at cluster level
 	Concurrency  int            // default to 1
 	Prober       interface{}    // default to nil
 	Stats        gostrich.Stats // default to nil
@@ -555,53 +549,53 @@ type ReliableServiceConf struct {
 }
 
 func NewReliableService(conf ReliableServiceConf) Service {
-	var sname string
-	var svc Service
-	var err error
 	var reporter ServiceReporter
 
-	supers := make([]*Supervisor, len(conf.Makers))
+	hosts := make([]*Supervisor, len(conf.Makers))
 	if conf.Stats != nil {
 		reporter = NewBasicStatsReporter(conf.Stats)
 	}
 	top := &Cluster{
 		Name:     conf.Name,
-		Services: supers,
+		Services: hosts,
 		Retries:  conf.Retries,
 		Reporter: reporter,
 	}
 
 	for i, maker := range conf.Makers {
+		// per host
 		var concur int
 		if conf.Concurrency == 0 {
 			concur = 1
 		} else {
 			concur = conf.Concurrency
 		}
-		services := make([]*Supervisor, concur)
-		cluster := &Cluster{Name: sname, Services: services}
-		for j := range services {
-			sname, svc, err = maker.Make()
+		conns := make([]*Supervisor, concur)
+		hostName := maker.Name()
+		host := &Cluster{Name: hostName, Services: conns}  // host is a cluster of connections
+		for j := range conns {
+			conn, err := maker.Make()
 			if err != nil {
-				log.Printf("Failed to make a service: %v %v. Error is %v", conf.Name, sname, err)
+				log.Printf("Failed to make a service: %v %v. Error is %v", conf.Name, hostName, err)
 			}
-			services[j] = NewReplaceable(
-				fmt.Sprintf("%v:conn:%v", conf.Name, j),
-				svc,
+			conns[j] = NewSupervisor(
+				fmt.Sprintf("%v:%v:%v", conf.Name, hostName, j),
+				conn,
 				func() float64 {
-					return cluster.LatencyAvg()
+					return host.LatencyAvg()
 				},
+				nil,
 				nil,
 				maker)
 		}
 		if conf.Stats != nil && conf.PerHostStats {
-			reporter = NewBasicStatsReporter(conf.Stats.Scoped(sname))
+			reporter = NewBasicStatsReporter(conf.Stats.Scoped(hostName))
 		} else {
 			reporter = nil
 		}
-		supers[i] = NewSupervisor(
-			sname,
-			cluster,
+		hosts[i] = NewSupervisor(
+			hostName,
+			host,
 			func() float64 {
 				return top.LatencyAvg()
 			},
@@ -627,6 +621,6 @@ func average(ns []int64) float64 {
 
 func chance(n int32)float32 {
 	q := float32((n / 10 + 1) * 10)           // upper floor to avoid extremes
-	return float32(supervisorHistorySize) / q // the chance we should record a event
+	return float32(supervisorHistorySize) / q / float32(reactionPeriod)// the chance we should record a event
 }
 
