@@ -5,7 +5,6 @@ import (
 
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"math/rand"
 	"net/rpc"
@@ -37,6 +36,8 @@ var (
 	// doesn't work and prober req would be in other form, e.g. a different request hitting same
 	// service.
 	ProberReqLastFail ProberReqLastFailType
+
+	logger                  = gostrich.NamedLogger { "[Rpcx]" }
 )
 
 const (
@@ -223,7 +224,7 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 	s.svcLock.RLock()
 	if s.service == nil {
 		err = NilUnderlyingServiceErr
-		//TODO: logging
+		logger.LogInfo("There's no underlying service for " + s.name)
 	} else {
 		err = s.service.Serve(req, rsp, cancel)
 	}
@@ -261,6 +262,11 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 	s.svcLock.RUnlock()
 	// End of lock
 
+	logger.LogInfoF(func()interface{} {
+		return fmt.Sprintf("Is dead %v, context: %v, latencyAvg: %v\n",
+			s.isDead(), s.latencyContext(), s.latencyAvg)
+	})
+
 	// react to faulty services.
 	switch {
 	case s.isDead():
@@ -271,28 +277,38 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 				// setting service to nil prevents service being used till new serivce is created.
 				s.svcLock.Lock()
 				if err := s.Close(); err != nil {
-					log.Printf("Error closing a service %v, the error is %v", s.name, err)
+					logger.LogInfoF(func()interface{} {
+						return fmt.Sprintf("Error closing a service %v, the error is %v", s.name, err)
+					})
 				}
 				s.service = nil
 				s.svcLock.Unlock()
 				go func() {
-					log.Printf("Service \"%v\" gone bad, start replacer routine. This will "+
-						"try replacing underlying service at fixed interval, until "+
-						"service become healthy.", s.name)
+					logger.LogInfoF(func()interface{} {
+						return "Service \"%v\" gone bad, start replacer routine. This will "+
+							   "try replacing underlying service at fixed interval, until "+
+							   "service become healthy." + s.name
+					})
 					for {
 						newService, err := s.serviceMaker.Make()
 						if err == nil {
-							log.Printf("replacer obtained new service for \"%v\"", s.name)
+							logger.LogInfoF(func() interface{} {
+								return fmt.Sprintf("replacer obtained new service for \"%v\"", s.name)
+							})
 							s.svcLock.Lock()
 							s.service = newService
 							s.latencies.Clear()
 							s.latencyAvg = 0
 							s.svcLock.Unlock()
-							log.Printf("replacer of \"%v\" successfully switched on a new service. Now exiting.", s.name)
+							logger.LogInfoF(func() interface{} {
+								return fmt.Sprintf("replacer of \"%v\" successfully switched on a new service. Now exiting.", s.name)
+							})
 							atomic.StoreInt32((*int32)(&s.replacerRunning), 0)
 							break
 						} else {
-							log.Printf("replacer errors out for \"%v\", will try later. %v", s.name, err)
+							logger.LogInfoF(func() interface{} {
+								return fmt.Sprintf("replacer errors out for \"%v\", will try later. %v", s.name, err)
+							})
 						}
 						time.Sleep(time.Duration(int64(replacerFreqSec)) * time.Second)
 					}
@@ -303,15 +319,21 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 		if s.proberReq != nil {
 			if atomic.CompareAndSwapInt32((*int32)(&s.proberRunning), 0, 1) {
 				go func() {
-					log.Printf("Service \"%v\" gone bad, start probing\n", s.name)
+					logger.LogInfoF(func() interface{} {
+						return fmt.Sprintf("Service \"%v\" gone bad, start probing\n", s.name)
+					})
 					for {
 						time.Sleep(time.Duration(int64(proberFreqSec)) * time.Second)
 						if !s.isDead() {
-							log.Printf("Service \"%v\" recovered, exit prober routine\n", s.name)
+							logger.LogInfoF(func() interface{} {
+								return fmt.Sprintf("Service \"%v\" recovered, exit prober routine\n", s.name)
+							})
 							atomic.StoreInt32((*int32)(&s.proberRunning), 0)
 							break
 						}
-						log.Printf("Service %v is dead, probing..", s.name)
+						logger.LogInfoF(func() interface{} {
+							return fmt.Sprintf("Service %v is dead, probing..", s.name)
+						})
 
 						switch s.proberReq.(type) {
 						case ProberReqLastFailType:
@@ -469,13 +491,17 @@ func (c *Cluster) Serve(req interface{}, rsp interface{}, cancel *bool) (err err
 		if err == nil {
 			return
 		} else {
-			log.Printf("Error serving request in cluster %v. Error is: %v\n", c.Name, err)
+			logger.LogInfoF(func() interface{} {
+				return fmt.Sprintf("Error serving request in cluster %v. Error is: %v\n", c.Name, err)
+			})
 		}
 		if cancel != nil && *cancel {
 			return
 		}
 	}
-	log.Printf("Exhausted retries of serving request in cluster %v\n", c.Name)
+	logger.LogInfoF(func() interface{} {
+		return fmt.Sprintf("Exhausted retries of serving request in cluster %v\n", c.Name)
+	})
 	return
 }
 
@@ -576,7 +602,9 @@ func NewReliableService(conf ReliableServiceConf) Service {
 		for j := range conns {
 			conn, err := maker.Make()
 			if err != nil {
-				log.Printf("Failed to make a service: %v %v. Error is %v", conf.Name, hostName, err)
+				logger.LogInfoF(func() interface{} {
+					return fmt.Sprintf("Failed to make a service: %v %v. Error is %v", conf.Name, hostName, err)
+				})
 			}
 			conns[j] = NewSupervisor(
 				fmt.Sprintf("%v:%v:%v", conf.Name, hostName, j),
