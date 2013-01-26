@@ -23,7 +23,6 @@ import (
    TODO:
      - Service discovery (ServerSet)
      - Dynamic adjust of number of connections (do we need?)
-
  */
 
 var (
@@ -207,6 +206,7 @@ func (s *Supervisor) isDead() bool {
 }
 
 func (s *Supervisor) Close() (err error) {
+	logger.LogDbg("Supervisor " + s.name + " is closed")
 	s.svcLock.Lock()
 	defer s.svcLock.Unlock()
 
@@ -221,15 +221,18 @@ func (s *Supervisor) Close() (err error) {
  */
 func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err error) {
 	then := time.Now()
+	logger.LogDbg("Supervisor " + s.name + " serving request")
 	s.svcLock.RLock()
 	if s.service == nil {
-		err = NilUnderlyingServiceErr
 		logger.LogInfo("There's no underlying service for " + s.name)
+		err = NilUnderlyingServiceErr
 	} else {
+		logger.LogDbg("Supervisor " + s.name + " delegating to underlying service")
 		err = s.service.Serve(req, rsp, cancel)
 	}
 
 	latency := MicroTilNow(then)
+	logger.LogDbg(fmt.Sprintf("Supervisor %v finishes in %v micro sec", s.name, latency))
 
 	// collect stats before adjusting latency
 	if s.reporter != nil {
@@ -237,6 +240,7 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 	}
 
 	if err != nil {
+		logger.LogDbg("Supervisor " + s.name + " received error from underlying service: " + err.Error())
 		// treat errors as errorFactor times average context latency, ceiling at 60 seconds
 		latency = int64(math.Min(s.latencyContext()*errorFactor, float64(maxErrorMicros)))
 	}
@@ -246,23 +250,27 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 		s.latencies.Observe(latency)
 		sampled := s.latencies.Sampled()
 		avg := average(sampled)
+		logger.LogDbg(fmt.Sprintf("Supervisor %v is logging stats, current avg latency is %v", s.name, avg))
 		// set average for faster access later on.
 		atomic.StoreInt64(&(s.latencyAvg), int64(avg))
 	}
 	if s.latencies.Count() < int64(s.latencies.Length()) {
+		logger.LogDbg(fmt.Sprintf("Supervisor %v, chance of recording latency is 100%%"))
 		// fill all sample slots first, the case for startup
 		recordIt()
 	} else {
 		// logic: we have keep 30 "supervisorHistorySize" samples and want to span that across
 		// 5 sec (reactionPeriod), if we are at 6 qps, we do full sample; if we are at 60 qps,
 		// we sample every 10%
-		gostrich.DoWithChance(chance(s.qps.Ticks()), recordIt)
+		c := chance(s.qps.Ticks())
+		logger.LogDbg(fmt.Sprintf("Supervisor %v, chance of recording latency is %v%%", s.name, c * 100))
+		gostrich.DoWithChance(c, recordIt)
 	}
 
 	s.svcLock.RUnlock()
 	// End of lock
 
-	logger.LogInfoF(func()interface{} {
+	logger.LogDbgF(func()interface{} {
 		return fmt.Sprintf("Is dead %v, context: %v, latencyAvg: %v\n",
 			s.isDead(), s.latencyContext(), s.latencyAvg)
 	})
@@ -270,6 +278,7 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 	// react to faulty services.
 	switch {
 	case s.isDead():
+		logger.LogDbg("Supervisor " + s.name + " is dead")
 		// Reactions to service being dead:
 		// If we have serviceMaker, try make a new service out of it.
 		if s.serviceMaker != nil {
@@ -434,10 +443,12 @@ func (c *Cluster) LatencyAvg() float64 {
 
 // this is only called if there's at least one downstream service register. so this must succeed
 func (c *Cluster) pickAService() *Supervisor {
+	logger.LogDbg(fmt.Sprintf("Cluster %v needs to pick a service", c.Name))
 	prob := 0.0
+	tries := 0
 	latencyC := c.LatencyAvg()
 	var s *Supervisor
-	for retries := 0; rand.Float64() >= prob && retries < maxSelectorRetry; retries += 1 {
+	for ; rand.Float64() >= prob && tries < maxSelectorRetry; tries += 1 {
 		s = c.Services[rand.Int()%len(c.Services)]
 		if s.isDead() {
 			// if all services are dead, we will choose the last one, this is by design
@@ -445,28 +456,34 @@ func (c *Cluster) pickAService() *Supervisor {
 		}
 		prob = math.Min(1, (latencyC*latencyBuffer)/float64(math.Max(float64(s.latencyAvg), 1)))
 	}
+	logger.LogDbg(fmt.Sprintf("Cluster %v picked a service after %v tries", c.Name, tries))
 	return s
 }
 
 func (c *Cluster) serveOnce(req interface{}, rsp interface{}, cancel *bool) (err error) {
+	logger.LogDbg(fmt.Sprintf("Cluster %v serve once", c.Name))
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
 	then := time.Now()
 
 	if len(c.Services) == 0 {
+		logger.LogDbg(fmt.Sprintf("Cluster %v no services registered", c.Name))
 		err = NilUnderlyingServiceErr
 		return
 	}
 
 	// pick one random
+	logger.LogDbg(fmt.Sprintf("Cluster %v to pick a service", c.Name))
 	s := c.pickAService()
 
 	// serve
+	logger.LogDbg(fmt.Sprintf("Cluster %v to serve", c.Name))
 	err = s.Serve(req, rsp, cancel)
 
 	if c.Reporter != nil {
 		latency := MicroTilNow(then)
+		logger.LogDbg(fmt.Sprintf("Cluster %v served request in %v micro", c.Name, latency))
 		c.Reporter.Report(req, rsp, err, latency)
 	}
 
@@ -487,6 +504,7 @@ func (c *Cluster) Close() (err error) {
 
 func (c *Cluster) Serve(req interface{}, rsp interface{}, cancel *bool) (err error) {
 	for i := 0; i <= c.Retries; i += 1 {
+		logger.LogDbg(fmt.Sprintf("Cluster %v serves request with try %v", c.Name, i+1))
 		err = c.serveOnce(req, rsp, cancel)
 		if err == nil {
 			return
