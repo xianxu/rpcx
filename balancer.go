@@ -18,7 +18,8 @@ import (
      - Load balancing among multiple hosts/connections evenly (number of qps).
      - Aware of difference in machine power. Query fast machines more.
      - Probing when a service's dead (Supervisor).
-     - Recreate service when dead for a while (Supervisor)
+     - Recreate service when dead for a while (Supervisor).
+     - And be conscious about how much memory we use.
 
    TODO:
      - Service discovery (ServerSet)
@@ -36,30 +37,34 @@ var (
 	// service.
 	ProberReqLastFail ProberReqLastFailType
 
-	logger                  = gostrich.NamedLogger { "[Rpcx]" }
+	// Internals
+	logger = gostrich.NamedLogger { "[Rpcx]" }
 )
 
 const (
 	proberFreqSec    int32 = 5
-	replacerFreqSec  int32 = 30
+	replacerFreqSec  int32 = 10
 	maxSelectorRetry int   = 20
 
 	// Note, the following can be tweaked for fault tolerant behavior. They can be made as per
 	// service configuration. However, I feel a good choice of values can provide sufficient values,
 	// and freeing clients to figure out good values of those arcane numbers.
-	deadThreshold  float64 = 4   // factor over normal to be considered dead
 	errorFactor    float64 = 30  // treat errors as X times of normal latency
 	latencyBuffer  float64 = 1.5 // factor of how bad latency compared to context before react
 
 	// max error latency
-	maxErrorMicros int64   = 60000000
+	maxErrorMicros int64   = 60000000 // 1 min
+	// default error latency, used when latency context's not initialized.
+	defaultErrorMicros int64   = 5000000 // 5 sec
 
 	// size of history to keep
-	supervisorHistorySize int = 30
+	supervisorHistorySize int = 15
 	// how long latency history do we care, 5 second seems reasonable
 	reactionPeriod int = 5
-	// how many items needs to be collected before we consider marking service dead
-	supervisorHistoryPadding int64 = 5
+	// collect per second
+	collectPerPeriod = supervisorHistorySize/reactionPeriod
+	// at which error rate (of previous second) do we consider service dead.
+	deadErrorRate float64 = 0.5
 )
 
 type Error string
@@ -87,16 +92,18 @@ type Service interface {
 }
 
 /*
- * Maker of a service, this is used to recreate a service in case of persisted errors. Maker would
- * typically wrap state such as which host to connect to etc.
+Maker of a service, this is used to recreate a service in case of persisted errors. Maker would
+typically wrap state such as which host to connect to etc.
  */
 type ServiceMaker interface {
 	Name() string
 	Make() (s Service, e error)
 }
 
-// General interface used to do basic reporting of service status. the parameters in order are:
-// req, rep, error and latency.
+/*
+General interface used to do basic reporting of service status. the parameters in order are:
+req, rep, error and latency.
+ */
 type ServiceReporter interface {
 	Report(interface{}, interface{}, error, int64)
 }
@@ -107,28 +114,32 @@ type ProberReqLastFailType int
 // Wrapping on top of a Service, keeping track service history for load balancing purpose.
 // There are two strategy dealing with faulty services, either we can keep probing it, or
 // we can create a new service to replace the faulty one. Supervisor's intended to work in
-// a Cluster, rather than be used alone. TODO: hide this?
+// a Cluster, rather than be used alone.
+//
+// Service load is adjusted based on latency stats. Service status (dead or not) is determined
+// based on error rate.
 type Supervisor struct {
 	// lock used to guard change of underlying service.
 	svcLock sync.RWMutex
 
-	// underlying service
+	// underlying service, guarded by svcLock
 	service Service
 
 	// Human readable name for logging purpose
 	name string
 
-	// latency stats
-	// Keeps track of host latency, in micro seconds
+	// Keeps track of host latency, in micro seconds. If this is nil, latency stats are not keep
+	// and latencyAvg is assumed to be defaultErrorMicros.
 	latencies gostrich.IntSampler
 
-	// Average latency, cached value from latencies sampler
+	// Average latency, cached value from latencies sampler. Only populated if latencies is not nil
 	latencyAvg int64
 
 	// A function that returns what's the average latency across some computation context, such
 	// as within a cluster. This gives context of how slow/bad this Service is performance, with
 	// respect to its peers. Supervisor's coded to react when self latency hitting 2x and 4x
-	// of latency context.
+	// of latency context. If this is nil, latency context is assumed to be a const of
+	// defaultErrorMicros.
 	latencyContext func() float64
 
 	// Note the following two fields are int32 so that we can compare/set atomically
@@ -151,24 +162,25 @@ type Supervisor struct {
 	// When proberReq is not nil, probing will be started. When serviceMaker is nil, underlying
 	// service will not be replaced.
 	proberReq interface{}
-
 	serviceMaker ServiceMaker
 
 	// where to report service status, gostrich thing
 	reporter ServiceReporter
 
-	// estimate of current qps
+	// estimate of current query per second, as well as error per second
 	qps *gostrich.QpsTracker
-}
 
-// A Balancer is Supervisor that tracks last 30 service call status. It recovers mostly by keep
-// probing. In other cases, ServiceMaker may be invoked to recreate all underlying services.
+	// if this service is considered dead. When as service is dead, a Cluster will try avoid it
+	// if possible.
+	dead int32
+}
 
 // Note: The name + service is somewhat duplicate of serviceMaker, it's there so that serviceMaker
 //       is not mandatory.
 func NewSupervisor(
 	name string,
 	service Service,
+	latencies gostrich.IntSampler,
 	latencyContext func() float64,
 	reporter ServiceReporter,
 	proberReq interface{},
@@ -177,8 +189,8 @@ func NewSupervisor(
 		sync.RWMutex{},
 		service,
 		name,
-		gostrich.NewIntSampler(supervisorHistorySize),
-		0, //TODO: good default?
+		latencies,
+		0,
 		latencyContext,
 		0,
 		0,
@@ -186,6 +198,7 @@ func NewSupervisor(
 		serviceMaker,
 		reporter,
 		gostrich.NewQpsTracker(time.Second),
+		0,
 	}
 }
 
@@ -193,16 +206,24 @@ func MicroTilNow(then time.Time) int64 {
 	return time.Now().Sub(then).Nanoseconds() / 1000
 }
 
+func (s *Supervisor) getLatencyAvg() float64 {
+	if s.latencies == nil {
+		return float64(defaultErrorMicros)
+ 	}
+	return float64(atomic.LoadInt64(&s.latencyAvg))
+}
+
 func (s *Supervisor) isDead() bool {
-	// wait till we have enough "bad" samples before reporting dead. Also, if there's no context
-	// service won't be dead thus bypassing all service recreation logic. If Supervisor's used
-	// directly outside of a Cluster, supply a function that reports "normal" latency as context.
-	if s.latencies.Count() <= supervisorHistoryPadding || s.latencyContext == nil {
-		return false
-	}
-	avg := atomic.LoadInt64(&(s.latencyAvg))
-	overallAvg := s.latencyContext()
-	return float64(avg) >= deadThreshold*overallAvg
+	return atomic.LoadInt32(&s.dead) != 0 || s.isErrorTooHigh()
+}
+
+func (s *Supervisor) isErrorTooHigh() bool {
+	// use qps of both ticks as qps to get latest stats
+	q1, e1, q2, e2 := s.qps.Ticks()
+	q := q1 + q2
+	e := e1 + e2
+	logger.LogDbg(fmt.Sprintf("Supervisor %v: qps %v, eps %v", s.name, q, e))
+	return q > 0 && e > 0 && float64(e) > deadErrorRate * float64(q)
 }
 
 func (s *Supervisor) Close() (err error) {
@@ -224,7 +245,7 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 	logger.LogDbg("Supervisor " + s.name + " serving request")
 	s.svcLock.RLock()
 	if s.service == nil {
-		logger.LogInfo("There's no underlying service for " + s.name)
+		logger.LogDbg("There's no underlying service for " + s.name)
 		err = NilUnderlyingServiceErr
 	} else {
 		logger.LogDbg("Supervisor " + s.name + " delegating to underlying service")
@@ -232,7 +253,7 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 	}
 
 	latency := MicroTilNow(then)
-	logger.LogDbg(fmt.Sprintf("Supervisor %v finishes in %v micro sec", s.name, latency))
+	logger.LogDbg(fmt.Sprintf("Supervisor %v finishes in %v micro sec and err is %v", s.name, latency, err))
 
 	// collect stats before adjusting latency
 	if s.reporter != nil {
@@ -241,57 +262,76 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 
 	if err != nil {
 		logger.LogDbg("Supervisor " + s.name + " received error from underlying service: " + err.Error())
-		// treat errors as errorFactor times average context latency, ceiling at 60 seconds
-		latency = int64(math.Min(s.latencyContext()*errorFactor, float64(maxErrorMicros)))
+		// treat errors as errorFactor times average context latency to discourage calling
+		// erroneous service.
+		if s.latencyContext == nil || s.latencyContext() == 0 {
+			// if there's no good latency context, set a default
+			latency = defaultErrorMicros
+		} else {
+			latency = int64(math.Min(s.latencyContext()*errorFactor, float64(maxErrorMicros)))
+		}
 	}
 
-	s.qps.Record()
-	recordIt := func() {
-		s.latencies.Observe(latency)
-		sampled := s.latencies.Sampled()
-		avg := average(sampled)
-		logger.LogDbg(fmt.Sprintf("Supervisor %v is logging stats, current avg latency is %v", s.name, avg))
-		// set average for faster access later on.
-		atomic.StoreInt64(&(s.latencyAvg), int64(avg))
+	s.qps.Record(err != nil)
+	// Determine sampling rate, we keep a subset of latency stats of the last few seconds. Sampling
+	// is done here to be more efficient.
+	if s.latencies != nil {
+		recordIt := func() {
+			s.latencies.Observe(latency)
+			sampled := s.latencies.Sampled()
+			avg := average(sampled)
+			// set average for faster access later on.
+			atomic.StoreInt64(&(s.latencyAvg), int64(avg))
+		}
+		if s.latencies.Count() < int64(s.latencies.Length()) {
+			logger.LogDbg(fmt.Sprintf("Supervisor %v, chance of recording latency is 100%%", s.name))
+			// fill all sample slots first, the case for startup
+			recordIt()
+		} else {
+			// logic: we have keep 30 "supervisorHistorySize" samples and want to span that across
+			// 5 sec (reactionPeriod), if we are at 6 qps, we do full sample; if we are at 60 qps,
+			// we sample every 10%
+			q1, _, q2, _ := s.qps.Ticks()
+			q := q1 + q2
+			logger.LogDbg(
+				fmt.Sprintf("Supervisor %v, estimated qps is %v and %v (%v)", s.name, q1, q2, q))
+
+			c := chance(q)
+			logger.LogDbg(
+				fmt.Sprintf("Supervisor %v, chance of recording latency is %v%%", s.name, c * 100))
+			gostrich.DoWithChance(c, recordIt)
+		}
 	}
-	if s.latencies.Count() < int64(s.latencies.Length()) {
-		logger.LogDbg(fmt.Sprintf("Supervisor %v, chance of recording latency is 100%%"))
-		// fill all sample slots first, the case for startup
-		recordIt()
-	} else {
-		// logic: we have keep 30 "supervisorHistorySize" samples and want to span that across
-		// 5 sec (reactionPeriod), if we are at 6 qps, we do full sample; if we are at 60 qps,
-		// we sample every 10%
-		c := chance(s.qps.Ticks())
-		logger.LogDbg(fmt.Sprintf("Supervisor %v, chance of recording latency is %v%%", s.name, c * 100))
-		gostrich.DoWithChance(c, recordIt)
+
+	errorTooHigh := s.isErrorTooHigh()
+	if errorTooHigh && (s.serviceMaker != nil || s.proberReq != nil) {
+		// if service is considered dead and we have either a prober or a serviceMaker, we will
+		// mark this service as dead explicitly and wait till one of those two processes move
+		// service back to healthy.
+		atomic.StoreInt32(&s.dead, 1)
 	}
 
 	s.svcLock.RUnlock()
 	// End of lock
 
-	logger.LogDbgF(func()interface{} {
-		return fmt.Sprintf("Is dead %v, context: %v, latencyAvg: %v\n",
-			s.isDead(), s.latencyContext(), s.latencyAvg)
-	})
+	logger.LogDbg(fmt.Sprintf("Supervisor %v errTooHigh %v", s.name, errorTooHigh))
 
 	// react to faulty services.
 	switch {
-	case s.isDead():
-		logger.LogDbg("Supervisor " + s.name + " is dead")
-		// Reactions to service being dead:
+	case errorTooHigh:
+		logger.LogDbg("Supervisor " + s.name + " error rate's too high")
+		// Reactions to service being faulty:
 		// If we have serviceMaker, try make a new service out of it.
 		if s.serviceMaker != nil {
+			logger.LogDbg("Supervisor " + s.name + " is dead. serviceMaker's not nil")
 			if atomic.CompareAndSwapInt32((*int32)(&s.replacerRunning), 0, 1) {
-				// setting service to nil prevents service being used till new serivce is created.
-				s.svcLock.Lock()
+				logger.LogDbg("Supervisor " + s.name + " is dead. refresher is to be started")
+				// close existing service.
 				if err := s.Close(); err != nil {
 					logger.LogInfoF(func()interface{} {
 						return fmt.Sprintf("Error closing a service %v, the error is %v", s.name, err)
 					})
 				}
-				s.service = nil
-				s.svcLock.Unlock()
 				go func() {
 					logger.LogInfoF(func()interface{} {
 						return "Service \"%v\" gone bad, start replacer routine. This will "+
@@ -306,8 +346,11 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 							})
 							s.svcLock.Lock()
 							s.service = newService
-							s.latencies.Clear()
+							if s.latencies != nil {
+								s.latencies.Clear()
+							}
 							s.latencyAvg = 0
+							atomic.StoreInt32(&s.dead, 0)
 							s.svcLock.Unlock()
 							logger.LogInfoF(func() interface{} {
 								return fmt.Sprintf("replacer of \"%v\" successfully switched on a new service. Now exiting.", s.name)
@@ -326,30 +369,33 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 		}
 		// if we have a prober, set to probe it, since traffic to this end point will be very limited.
 		if s.proberReq != nil {
+			logger.LogDbg("Supervisor " + s.name + " is dead. proberReq's not nil")
 			if atomic.CompareAndSwapInt32((*int32)(&s.proberRunning), 0, 1) {
+				logger.LogDbg("Supervisor " + s.name + " is dead. prober is to be started")
 				go func() {
 					logger.LogInfoF(func() interface{} {
 						return fmt.Sprintf("Service \"%v\" gone bad, start probing\n", s.name)
 					})
 					for {
 						time.Sleep(time.Duration(int64(proberFreqSec)) * time.Second)
-						if !s.isDead() {
-							logger.LogInfoF(func() interface{} {
-								return fmt.Sprintf("Service \"%v\" recovered, exit prober routine\n", s.name)
-							})
-							atomic.StoreInt32((*int32)(&s.proberRunning), 0)
-							break
-						}
-						logger.LogInfoF(func() interface{} {
-							return fmt.Sprintf("Service %v is dead, probing..", s.name)
-						})
-
 						switch s.proberReq.(type) {
 						case ProberReqLastFailType:
 							s.Serve(req, rsp, nil)
 						default:
 							s.Serve(s.proberReq, rsp, nil)
 						}
+						if !s.isErrorTooHigh() {
+							logger.LogInfoF(func() interface{} {
+								return fmt.Sprintf("Service \"%v\" recovered, exit prober routine\n", s.name)
+							})
+							atomic.StoreInt32((*int32)(&s.proberRunning), 0)
+							atomic.StoreInt32(&s.dead, 0)
+							break
+						}
+						logger.LogInfoF(func() interface{} {
+							return fmt.Sprintf("Service %v is dead, probing..", s.name)
+						})
+
 					}
 				}()
 			}
@@ -429,34 +475,54 @@ type Cluster struct {
 	lock sync.RWMutex // guard services
 }
 
-// this is only called if there's at least one downstream service register. so this must succeed
-func (c *Cluster) LatencyAvg() float64 {
+// This is only called if there's at least one downstream service register. so this must succeed
+// If there's only a single Supervisor registered with the cluster, it's latency's returned,
+//   effectively disable mark dead (because in this case cluster latency and service latency always
+//   match).
+// Otherwise return cluster latency without supervisor.
+func (c *Cluster) LatencyAvg(excl *Supervisor) float64 {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
+	if len(c.Services) == 1 {
+		l := c.Services[0].getLatencyAvg()
+		logger.LogDbg(fmt.Sprintf("%v (singleton) avg latency: %v", c.Name, l))
+		return float64(l)
+	}
 
 	sum := 0.0
 	for _, s := range c.Services {
-		sum += float64(atomic.LoadInt64(&(s.latencyAvg)))
+		logger.LogDbg(fmt.Sprintf("%v avg latency: %v", s.name, s.getLatencyAvg()))
+		if s != excl {
+			sum += s.getLatencyAvg()
+		}
 	}
-	return sum / float64(len(c.Services))
+	var avg float64
+	if excl == nil {
+		avg = sum / float64(len(c.Services))
+		logger.LogDbg(fmt.Sprintf("%v avg latency: %v", c.Name, avg))
+	} else {
+		avg = sum / float64(len(c.Services) - 1)
+		logger.LogDbg(fmt.Sprintf("%v (exclusive) avg latency: %v", c.Name, avg))
+	}
+	return avg
 }
 
 // this is only called if there's at least one downstream service register. so this must succeed
 func (c *Cluster) pickAService() *Supervisor {
-	logger.LogDbg(fmt.Sprintf("Cluster %v needs to pick a service", c.Name))
 	prob := 0.0
 	tries := 0
-	latencyC := c.LatencyAvg()
 	var s *Supervisor
+	latencyC := c.LatencyAvg(nil)
 	for ; rand.Float64() >= prob && tries < maxSelectorRetry; tries += 1 {
 		s = c.Services[rand.Int()%len(c.Services)]
 		if s.isDead() {
 			// if all services are dead, we will choose the last one, this is by design
 			continue
 		}
-		prob = math.Min(1, (latencyC*latencyBuffer)/float64(math.Max(float64(s.latencyAvg), 1)))
+		prob = math.Min(1, (latencyC*latencyBuffer)/float64(math.Max(float64(s.getLatencyAvg()), 1)))
+		logger.LogDbg(fmt.Sprintf("Cluster %v picking prob is %v, tries %v", c.Name, prob, tries))
 	}
-	logger.LogDbg(fmt.Sprintf("Cluster %v picked a service after %v tries", c.Name, tries))
+	logger.LogDbg(fmt.Sprintf("Cluster %v picked %v after %v tries", c.Name, s.name, tries))
 	return s
 }
 
@@ -627,9 +693,8 @@ func NewReliableService(conf ReliableServiceConf) Service {
 			conns[j] = NewSupervisor(
 				fmt.Sprintf("%v:%v:%v", conf.Name, hostName, j),
 				conn,
-				func() float64 {
-					return host.LatencyAvg()
-				},
+				nil,
+				nil,
 				nil,
 				nil,
 				maker)
@@ -642,12 +707,14 @@ func NewReliableService(conf ReliableServiceConf) Service {
 		hosts[i] = NewSupervisor(
 			hostName,
 			host,
-			func() float64 {
-				return top.LatencyAvg()
-			},
+			gostrich.NewIntSampler(supervisorHistorySize),
+			nil,
 			reporter,
 			conf.Prober,
 			nil)
+		hosts[i].latencyContext = func() float64 {
+			return top.LatencyAvg(hosts[i])
+		}
 	}
 	return top
 }
@@ -666,7 +733,7 @@ func average(ns []int64) float64 {
 }
 
 func chance(n int32)float32 {
-	q := float32((n / 10 + 1) * 10)           // upper floor to avoid extremes
-	return float32(supervisorHistorySize) / q / float32(reactionPeriod)// the chance we should record a event
+	q := math.Max(float64(collectPerPeriod), float64(n))
+	return float32(supervisorHistorySize) / float32(q) / float32(reactionPeriod)// the chance we should record a event
 }
 
