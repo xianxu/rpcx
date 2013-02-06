@@ -24,7 +24,7 @@ import (
    TODO:
      - Service discovery (ServerSet)
      - Dynamic adjust of number of connections (do we need?)
- */
+*/
 
 var (
 	TimeoutErr              = Error("request timeout")
@@ -38,7 +38,7 @@ var (
 	ProberReqLastFail ProberReqLastFailType
 
 	// Internals
-	logger = gostrich.NamedLogger { "[Rpcx]" }
+	logger = gostrich.NamedLogger{"[Rpcx]"}
 )
 
 const (
@@ -49,20 +49,20 @@ const (
 	// Note, the following can be tweaked for fault tolerant behavior. They can be made as per
 	// service configuration. However, I feel a good choice of values can provide sufficient values,
 	// and freeing clients to figure out good values of those arcane numbers.
-	errorFactor    float64 = 30  // treat errors as X times of normal latency
-	latencyBuffer  float64 = 1.5 // factor of how bad latency compared to context before react
+	errorFactor   float64 = 30  // treat errors as X times of normal latency
+	latencyBuffer float64 = 1.5 // factor of how bad latency compared to context before react
 
 	// max error latency
-	maxErrorMicros int64   = 60000000 // 1 min
+	maxErrorMicros int64 = 60000000 // 1 min
 	// default error latency, used when latency context's not initialized.
-	defaultErrorMicros int64   = 5000000 // 5 sec
+	defaultErrorMicros int64 = 5000000 // 5 sec
 
 	// size of history to keep
 	supervisorHistorySize int = 15
 	// how long latency history do we care, 5 second seems reasonable
 	reactionPeriod int = 5
 	// collect per second
-	collectPerPeriod = supervisorHistorySize/reactionPeriod
+	collectPerPeriod = supervisorHistorySize / reactionPeriod
 	// at which error rate (of previous second) do we consider service dead.
 	deadErrorRate float64 = 0.5
 )
@@ -82,7 +82,7 @@ The cancel argument's used for caller to signal cancellation. This is mostly for
 implementation may or may not honor it.
 
 Service also implement the io.Closer interface for simple life cycle management.
- */
+*/
 type Service interface {
 	// release any resources associated with this service.
 	io.Closer
@@ -94,7 +94,7 @@ type Service interface {
 /*
 Maker of a service, this is used to recreate a service in case of persisted errors. Maker would
 typically wrap state such as which host to connect to etc.
- */
+*/
 type ServiceMaker interface {
 	Name() string
 	Make() (s Service, e error)
@@ -103,7 +103,7 @@ type ServiceMaker interface {
 /*
 General interface used to do basic reporting of service status. the parameters in order are:
 req, rep, error and latency.
- */
+*/
 type ServiceReporter interface {
 	Report(interface{}, interface{}, error, int64)
 }
@@ -161,7 +161,7 @@ type Supervisor struct {
 	//
 	// When proberReq is not nil, probing will be started. When serviceMaker is nil, underlying
 	// service will not be replaced.
-	proberReq interface{}
+	proberReq    interface{}
 	serviceMaker ServiceMaker
 
 	// where to report service status, gostrich thing
@@ -209,7 +209,7 @@ func MicroTilNow(then time.Time) int64 {
 func (s *Supervisor) getLatencyAvg() float64 {
 	if s.latencies == nil {
 		return float64(defaultErrorMicros)
- 	}
+	}
 	return float64(atomic.LoadInt64(&s.latencyAvg))
 }
 
@@ -223,7 +223,7 @@ func (s *Supervisor) isErrorTooHigh() bool {
 	q := q1 + q2
 	e := e1 + e2
 	logger.LogDbg(fmt.Sprintf("Supervisor %v: qps %v, eps %v", s.name, q, e))
-	return q > 0 && e > 0 && float64(e) > deadErrorRate * float64(q)
+	return q > 0 && e > 0 && float64(e) > deadErrorRate*float64(q)
 }
 
 func (s *Supervisor) Close() (err error) {
@@ -298,7 +298,7 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 
 			c := chance(q)
 			logger.LogDbg(
-				fmt.Sprintf("Supervisor %v, chance of recording latency is %v%%", s.name, c * 100))
+				fmt.Sprintf("Supervisor %v, chance of recording latency is %v%%", s.name, c*100))
 			gostrich.DoWithChance(c, recordIt)
 		}
 	}
@@ -328,15 +328,15 @@ func (s *Supervisor) Serve(req interface{}, rsp interface{}, cancel *bool) (err 
 				logger.LogDbg("Supervisor " + s.name + " is dead. refresher is to be started")
 				// close existing service.
 				if err := s.Close(); err != nil {
-					logger.LogInfoF(func()interface{} {
+					logger.LogInfoF(func() interface{} {
 						return fmt.Sprintf("Error closing a service %v, the error is %v", s.name, err)
 					})
 				}
 				go func() {
-					logger.LogInfoF(func()interface{} {
-						return "Service \"%v\" gone bad, start replacer routine. This will "+
-							   "try replacing underlying service at fixed interval, until "+
-							   "service become healthy." + s.name
+					logger.LogInfoF(func() interface{} {
+						return "Service \"%v\" gone bad, start replacer routine. This will " +
+							"try replacing underlying service at fixed interval, until " +
+							"service become healthy." + s.name
 					})
 					for {
 						newService, err := s.serviceMaker.Make()
@@ -467,7 +467,7 @@ type Cluster struct {
 	Name     string
 	Services []*Supervisor
 	// if there's failure, retry another host, this is the number of times to retry
-	Retries  int
+	Retries int
 	// stats reporter of how cluster, rolled up from each host
 	Reporter ServiceReporter
 
@@ -501,7 +501,7 @@ func (c *Cluster) LatencyAvg(excl *Supervisor) float64 {
 		avg = sum / float64(len(c.Services))
 		logger.LogDbg(fmt.Sprintf("%v avg latency: %v", c.Name, avg))
 	} else {
-		avg = sum / float64(len(c.Services) - 1)
+		avg = sum / float64(len(c.Services)-1)
 		logger.LogDbg(fmt.Sprintf("%v (exclusive) avg latency: %v", c.Name, avg))
 	}
 	return avg
@@ -682,7 +682,7 @@ func NewReliableService(conf ReliableServiceConf) Service {
 		}
 		conns := make([]*Supervisor, concur)
 		hostName := maker.Name()
-		host := &Cluster{Name: hostName, Services: conns}  // host is a cluster of connections
+		host := &Cluster{Name: hostName, Services: conns} // host is a cluster of connections
 		for j := range conns {
 			conn, err := maker.Make()
 			if err != nil {
@@ -732,8 +732,7 @@ func average(ns []int64) float64 {
 	return float64(sum) / float64(len(ns))
 }
 
-func chance(n int32)float32 {
+func chance(n int32) float32 {
 	q := math.Max(float64(collectPerPeriod), float64(n))
-	return float32(supervisorHistorySize) / float32(q) / float32(reactionPeriod)// the chance we should record a event
+	return float32(supervisorHistorySize) / float32(q) / float32(reactionPeriod) // the chance we should record a event
 }
-
